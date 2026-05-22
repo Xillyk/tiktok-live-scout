@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tiktok-live-scout-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tiktok_live_scout
+      POSTGRES_USER: scout
+      POSTGRES_PASSWORD: scout
+    # No host port pinned — Docker assigns a free ephemeral port. The scout
+    # and web dashboard discover it at startup via `docker compose port`.
+    ports:
+      - "127.0.0.1::5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scout -d tiktok_live_scout"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

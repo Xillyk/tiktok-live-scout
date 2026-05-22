@@ -1,0 +1,29 @@
+# TikTok Live Scout configuration.
+# Add usernames (without the @) to the targets list to watch more accounts.
+
+targets:
+  - paloyzzzz05
+  - fon_.17
+  - peemwrk
+
+poll_interval_seconds: 60
+
+# Keep the TikTok browser visible while the scout runs.
+# Set to true to hide it. Headless mode may also trigger anti-bot UI from
+# TikTok (collapsed Following list, etc.), so headed is generally more
+# reliable for detection.
+headless: false
+
+# Persisted browser profile (cookies, localStorage). DO NOT commit.
+user_data_dir: ./data/auth
+
+# Where logs are written. State now lives in Postgres (see DATABASE_URL in .env).
+log_file: ./logs/scout.log
+
+# On detection failures the scout will dump screenshots + HTML here so you can
+# see what TikTok returned (helpful if selectors break).
+debug_dump_dir: ./data/debug
+
+web:
+  host: 127.0.0.1
+  port: 8766
