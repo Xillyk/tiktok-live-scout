@@ -370,23 +370,23 @@ async def dump_debug(page: Page, debug_dir: Path, label: str) -> None:
         log.debug("debug dump failed: %s", exc)
 
 
-async def cycle(page: Page, cfg: Config) -> None:
-    """One polling cycle: navigate to /live, expand the Following section,
-    decide live/offline for every target in a single page load, persist
-    state, emit notifications on transitions."""
-    statuses = await detect_via_live_page(page, cfg.targets, cfg.debug_dump_dir)
+async def cycle(page: Page, cfg: Config, profile) -> None:
+    """One polling cycle for the given profile."""
+    statuses = await detect_via_live_page(page, profile.targets, cfg.debug_dump_dir)
 
-    for username in cfg.targets:
+    for username in profile.targets:
         status = statuses.get(username, "unknown")
         if status == "unknown":
             log.warning(
-                "@%s status=unknown — see data/debug/ for what /live looked like",
+                "[%s] @%s status=unknown — see data/debug/",
+                profile.name,
                 username,
             )
 
-        event = db.record_check(username, status)
+        event = db.record_check(profile.name, username, status)
         log.info(
-            "@%s status=%s%s",
+            "[%s] @%s status=%s%s",
+            profile.name,
             username,
             status,
             " (transition!)" if event and event["event"] in ("live_start", "live_end") else "",
@@ -395,13 +395,13 @@ async def cycle(page: Page, cfg: Config) -> None:
         if event and event["event"] == "live_start":
             await notify.send(
                 cfg.discord_webhook_url,
-                f"@{username} is now LIVE → https://www.tiktok.com/@{username}/live",
+                f"[{profile.name}] @{username} is now LIVE → https://www.tiktok.com/@{username}/live",
                 notify.live_start_embed(username, event["at"]),
             )
         elif event and event["event"] == "live_end":
             await notify.send(
                 cfg.discord_webhook_url,
-                f"@{username} ended their live",
+                f"[{profile.name}] @{username} ended their live",
                 notify.live_end_embed(
                     username, event["at"], event.get("duration_seconds")
                 ),
@@ -436,30 +436,51 @@ async def main_async(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     setup_logging(cfg)
 
-    if not cfg.targets:
-        log.error("no targets configured in %s", args.config)
+    if not cfg.profiles:
+        log.error("no profiles configured in %s", args.config)
         return 1
 
-    cfg.user_data_dir.mkdir(parents=True, exist_ok=True)
+    # Pick the profile to run. If only one is defined and no --profile is
+    # given, use it implicitly.
+    if args.profile:
+        try:
+            profile = cfg.profile(args.profile)
+        except KeyError as exc:
+            log.error("%s", exc)
+            return 1
+    elif len(cfg.profiles) == 1:
+        profile = cfg.profiles[0]
+    else:
+        log.error(
+            "multiple profiles configured (%s) — pass --profile <name>",
+            ", ".join(p.name for p in cfg.profiles),
+        )
+        return 1
+
+    if not profile.targets:
+        log.error("profile %r has no targets configured", profile.name)
+        return 1
+
+    profile.user_data_dir.mkdir(parents=True, exist_ok=True)
     cfg.debug_dump_dir.mkdir(parents=True, exist_ok=True)
 
     if not (args.login or args.check_login):
-        # --login and --check-login don't touch the DB.
         db.init(cfg.database_url)
 
     # --login is the only mode that runs headed.
     headless = cfg.headless and not args.login
 
     log.info(
-        "starting scout: targets=%s interval=%ss headless=%s",
-        [f"@{t}" for t in cfg.targets],
+        "starting scout: profile=%s targets=%s interval=%ss headless=%s",
+        profile.name,
+        [f"@{t}" for t in profile.targets],
         cfg.poll_interval_seconds,
         headless,
     )
 
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
-            str(cfg.user_data_dir),
+            str(profile.user_data_dir),
             headless=headless,
             viewport={"width": 1366, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
@@ -512,7 +533,7 @@ async def main_async(args: argparse.Namespace) -> int:
         try:
             while True:
                 try:
-                    await cycle(page, cfg)
+                    await cycle(page, cfg, profile)
                 except Exception:  # noqa: BLE001
                     log.exception("cycle failed")
                     await dump_debug(page, cfg.debug_dump_dir, "cycle_error")
@@ -554,6 +575,11 @@ def setup_logging(cfg: Config) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="TikTok Live Scout")
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="profile name from config.yaml (required when >1 profile)",
+    )
     parser.add_argument(
         "--login",
         action="store_true",

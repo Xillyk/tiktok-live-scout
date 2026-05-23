@@ -25,27 +25,60 @@ Double-click **`tiktok-live-scout.command`** in Finder. It will, in order:
 1. Create the Python venv and install dependencies (first run only, ~1 min).
 2. Start Docker Desktop if it isn't running, wait for the daemon.
 3. `docker compose up -d` and wait for Postgres to report healthy.
-4. If no TikTok session cookie is present, open a Chromium login window
-   and wait until you've signed in. Close the window when the For You feed
-   is loaded.
-5. Start the web dashboard in the background (logs to `logs/web.stdout.log`).
-6. Open `http://127.0.0.1:8766` in your default browser.
+4. Show a native macOS picker listing every profile in `config.yaml`. Pick
+   the TikTok account you want to scout with (auto-selected silently if you
+   only have one profile).
+5. If that profile has no TikTok session yet, open a Chromium login window
+   and wait until you've signed in.
+6. Start (or reuse) the web dashboard at `http://127.0.0.1:8766` and open it
+   in your default browser.
 7. Run the scout in the foreground.
 
-`Ctrl+C` in the terminal window stops the scout AND the web dashboard
-(Postgres stays running — use `docker compose down` to stop it).
+`Ctrl+C` in the terminal stops just that profile's scout. The shared web
+dashboard stays up as long as any other launcher window is still scouting,
+then shuts down with the last one. Postgres always stays up — use
+`docker compose down` to stop it.
 
-> Tip: keep the `.command` file pinned to the Dock or Desktop. macOS may
-> prompt for security approval the first time (right-click → Open).
+> Tip: keep the `.command` pinned to the Dock or Desktop. macOS may prompt
+> for security approval the first time (right-click → Open).
 
-## Manual run (if you prefer separate processes)
+## Scouting multiple accounts in parallel
+
+Open a second Terminal and double-click `tiktok-live-scout.command` again.
+The picker reappears — choose a different profile. The two launchers run
+side-by-side: two Chromium windows, two scouts, one shared dashboard
+showing both profiles' targets grouped into sections.
+
+## Adding a profile (= another TikTok account)
+
+Edit `config.yaml`:
+
+```yaml
+profiles:
+  - name: bobabenz1
+    user_data_dir: ./data/auth
+    targets:
+      - paloyzzzz05
+      - fon_.17
+
+  - name: alt_account
+    user_data_dir: ./data/auth_alt
+    targets:
+      - new_target
+```
+
+Each profile gets its own `user_data_dir` (the Chromium cookies live there)
+and its own list of targets. The first launch against a new profile opens
+the login window automatically.
+
+## Manual run (no launcher)
 
 ```sh
 source .venv/bin/activate
-docker compose up -d              # start Postgres if not already
-python -m src.scout --login       # only needed once
-python -m src.scout               # terminal 1 — the watcher
-python -m src.web                 # terminal 2 — http://127.0.0.1:8766
+docker compose up -d
+python -m src.scout --login --profile bobabenz1   # one-time per profile
+python -m src.scout --profile bobabenz1           # terminal 1 — watcher
+python -m src.web                                 # terminal 2 — dashboard
 ```
 
 The Postgres container publishes on a random free host port — the scout and
@@ -55,19 +88,6 @@ other Postgres instances are impossible. Check the port with:
 ```sh
 docker compose port postgres 5432
 ```
-
-## Adding accounts
-
-Edit `config.yaml`:
-
-```yaml
-targets:
-  - paloyzzzz05
-  - someone_else
-  - another_one
-```
-
-Restart the scout. That's it.
 
 ## Where things live
 

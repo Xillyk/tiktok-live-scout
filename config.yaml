@@ -1,10 +1,31 @@
 # TikTok Live Scout configuration.
-# Add usernames (without the @) to the targets list to watch more accounts.
+#
+# Each profile is a separate logged-in TikTok account with its own
+# user_data_dir (cookies) and its own list of targets. On launch, the
+# .command shows a picker and you choose which profile to run.
 
-targets:
-  - paloyzzzz05
-  - fon_.17
-  - peemwrk
+profiles:
+  - name: bobabenz1
+    user_data_dir: ./data/auth
+    targets:
+      - paloyzzzz05
+      - fon_.17
+      - peemwrk
+
+  # Add a second profile by uncommenting and editing. Run `--login` once
+  # against the new profile to populate its user_data_dir.
+  - name: minasan245
+    user_data_dir: ./data/auth_minasan245
+    targets:
+      - manownongp
+
+  # Add a second profile by uncommenting and editing. Run `--login` once
+  # against the new profile to populate its user_data_dir.
+  # - name: alt_account
+  #   user_data_dir: ./data/auth_alt
+  #   targets:
+  #     - someone
+  #     - someone_else
 
 poll_interval_seconds: 60
 
@@ -14,15 +35,11 @@ poll_interval_seconds: 60
 # reliable for detection.
 headless: false
 
-# Persisted browser profile (cookies, localStorage). DO NOT commit.
-user_data_dir: ./data/auth
-
-# Where logs are written. State now lives in Postgres (see DATABASE_URL in .env).
-log_file: ./logs/scout.log
-
-# On detection failures the scout will dump screenshots + HTML here so you can
-# see what TikTok returned (helpful if selectors break).
+# Where the scout writes a screenshot/HTML when something looks off.
 debug_dump_dir: ./data/debug
+
+# Where logs go (rolling file).
+log_file: ./logs/scout.log
 
 web:
   host: 127.0.0.1

@@ -66,6 +66,12 @@ PAGE = Template(
   .events { margin-top: 6px; font-size: 12px; color: #888; }
   .events span { margin-right: 10px; }
   .empty { color: #777; padding: 24px; text-align: center; }
+  .profile-section { margin-bottom: 28px; }
+  .profile-header { display: flex; align-items: baseline; gap: 12px;
+                    margin: 18px 0 10px; padding-bottom: 6px;
+                    border-bottom: 1px solid #2a2a2c; }
+  .profile-name { font-size: 16px; font-weight: 600; }
+  .profile-meta { color: #888; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -74,37 +80,82 @@ PAGE = Template(
   <span class="scout-pill scout-{{ scout.label }}" title="{{ scout.detail }}">{{ scout.label }}</span>
 </h1>
 <div class="last">
-  Last poll: {{ last_poll_at or "never" }}
-  {% if scout.age_seconds is not none %}· {{ scout.age_human }} ago{% endif %}
+  Last poll: {% if last_poll_at %}<time class="ago" datetime="{{ last_poll_at }}">{{ last_poll_at }}</time>{% else %}never{% endif %}
   · auto-refresh 10s
 </div>
 
-{% if not targets %}
-  <div class="empty">No targets yet. Add usernames under <code>targets:</code> in config.yaml.</div>
+{% if not profiles %}
+  <div class="empty">No data yet — start the scout for any profile and refresh.</div>
 {% endif %}
 
-{% for name, t in targets.items() %}
-<div class="card">
-  <div class="dot {{ t.status }}"></div>
-  <div>
-    <div class="name"><a href="https://www.tiktok.com/@{{ name }}" target="_blank">@{{ name }}</a></div>
-    <div class="meta">
-      last check: {{ t.last_check or "—" }}
-      {% if t.status == "live" and t.live_started_at %}
-        · live for {{ t.live_duration }}
-      {% endif %}
+{% for prof_name, prof in profiles.items() %}
+<div class="profile-section">
+  <div class="profile-header">
+    <span class="profile-name">{{ prof_name }}</span>
+    <span class="profile-meta">
+      {{ prof.targets|length }} target{% if prof.targets|length != 1 %}s{% endif %}
+      {% if prof.last_poll_at %} · last poll <time class="ago" datetime="{{ prof.last_poll_at }}">{{ prof.last_poll_at }}</time>{% endif %}
+    </span>
+  </div>
+
+  {% for name, t in prof.targets.items() %}
+  <div class="card">
+    <div class="dot {{ t.status }}"></div>
+    <div>
+      <div class="name"><a href="https://www.tiktok.com/@{{ name }}" target="_blank">@{{ name }}</a></div>
+      <div class="meta">
+        last check: {% if t.last_check %}<time class="ago" datetime="{{ t.last_check }}">{{ t.last_check }}</time>{% else %}—{% endif %}
+        {% if t.status == "live" and t.live_started_at %}
+          · live for {{ t.live_duration }}
+        {% endif %}
+      </div>
+      <div class="events">
+        {% for ev in t.history[:5] %}
+          <span><time class="ago" datetime="{{ ev.at }}">{{ ev.at }}</time> — {{ event_label(ev.event) }}{% if ev.duration_seconds %} ({{ duration(ev.duration_seconds) }}){% endif %}</span>
+        {% endfor %}
+      </div>
     </div>
-    <div class="events">
-      {% for ev in t.history[:5] %}
-        <span>{{ ev.at }} — {{ ev.event }}{% if ev.duration_seconds %} ({{ ev.duration_seconds }}s){% endif %}</span>
-      {% endfor %}
+    <div class="right">
+      <span class="badge {{ t.status }}">{{ t.status }}</span>
     </div>
   </div>
-  <div class="right">
-    <span class="badge {{ t.status }}">{{ t.status }}</span>
-  </div>
+  {% endfor %}
 </div>
 {% endfor %}
+
+<script>
+(function () {
+  function rel(date) {
+    const now = new Date();
+    const diff = Math.round((now - date) / 1000); // seconds
+    if (Math.abs(diff) < 5)   return "just now";
+    if (diff < 60)            return diff + "s ago";
+    if (diff < 3600)          return Math.floor(diff / 60) + "m ago";
+    if (diff < 86400)         return Math.floor(diff / 3600) + "h ago";
+    if (diff < 86400 * 30)    return Math.floor(diff / 86400) + "d ago";
+    return date.toLocaleDateString(undefined,
+      {month: "short", day: "numeric", year: "numeric"});
+  }
+  function abs(date) {
+    return date.toLocaleString(undefined, {
+      year: "numeric", month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit", second: "2-digit",
+    });
+  }
+  function refresh() {
+    document.querySelectorAll("time.ago").forEach(function (el) {
+      const iso = el.getAttribute("datetime");
+      if (!iso) return;
+      const d = new Date(iso);
+      if (isNaN(d)) return;
+      el.textContent = rel(d);
+      el.setAttribute("title", abs(d));
+    });
+  }
+  refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
 
 </body>
 </html>
@@ -120,6 +171,17 @@ def _human_duration(seconds: int) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+_EVENT_LABELS = {
+    "live_start": "went LIVE",
+    "live_end": "ended live",
+    "first_seen_offline": "first sight (offline)",
+}
+
+
+def _event_label(name: str) -> str:
+    return _EVENT_LABELS.get(name, name)
 
 
 def _scout_status(last_poll_at: str | None, interval_seconds: int) -> dict:
@@ -160,21 +222,22 @@ def _scout_status(last_poll_at: str | None, interval_seconds: int) -> dict:
 
 def _read_state() -> dict:
     s = db.get_state()
-    targets = s.get("targets", {}) or {}
+    profiles = s.get("profiles", {}) or {}
     now = datetime.now(timezone.utc)
-    for t in targets.values():
-        t.setdefault("history", [])
-        t["live_duration"] = ""
-        started = t.get("live_started_at")
-        if t.get("status") == "live" and started:
-            try:
-                dt = datetime.fromisoformat(started)
-                t["live_duration"] = _human_duration(int((now - dt).total_seconds()))
-            except ValueError:
-                pass
+    for prof in profiles.values():
+        for t in prof["targets"].values():
+            t.setdefault("history", [])
+            t["live_duration"] = ""
+            started = t.get("live_started_at")
+            if t.get("status") == "live" and started:
+                try:
+                    dt = datetime.fromisoformat(started)
+                    t["live_duration"] = _human_duration(int((now - dt).total_seconds()))
+                except ValueError:
+                    pass
     interval = _cfg.poll_interval_seconds if _cfg else 60
     return {
-        "targets": targets,
+        "profiles": profiles,
         "last_poll_at": s.get("last_poll_at"),
         "scout": _scout_status(s.get("last_poll_at"), interval),
     }
@@ -183,7 +246,13 @@ def _read_state() -> dict:
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     data = _read_state()
-    return HTMLResponse(PAGE.render(**data))
+    return HTMLResponse(
+        PAGE.render(
+            event_label=_event_label,
+            duration=_human_duration,
+            **data,
+        )
+    )
 
 
 @app.get("/api/state")

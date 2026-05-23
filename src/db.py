@@ -29,16 +29,19 @@ log = logging.getLogger(__name__)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS target_state (
-    username         TEXT PRIMARY KEY,
+    profile          TEXT NOT NULL DEFAULT 'default',
+    username         TEXT NOT NULL,
     status           TEXT NOT NULL,
     last_check       TIMESTAMPTZ,
     last_change      TIMESTAMPTZ,
     live_started_at  TIMESTAMPTZ,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (profile, username)
 );
 
 CREATE TABLE IF NOT EXISTS live_events (
     id               BIGSERIAL PRIMARY KEY,
+    profile          TEXT NOT NULL DEFAULT 'default',
     username         TEXT NOT NULL,
     event            TEXT NOT NULL,
     at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -47,14 +50,46 @@ CREATE TABLE IF NOT EXISTS live_events (
 
 CREATE INDEX IF NOT EXISTS live_events_username_at_idx
     ON live_events (username, at DESC);
+CREATE INDEX IF NOT EXISTS live_events_profile_at_idx
+    ON live_events (profile, at DESC);
 
 CREATE TABLE IF NOT EXISTS poll_meta (
-    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    profile       TEXT PRIMARY KEY,
     last_poll_at  TIMESTAMPTZ
 );
 
-INSERT INTO poll_meta (id, last_poll_at) VALUES (1, NULL)
-    ON CONFLICT (id) DO NOTHING;
+-- Migrations for pre-multi-profile schemas. Each block is idempotent.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='target_state' AND column_name='profile'
+    ) THEN
+        ALTER TABLE target_state ADD COLUMN profile TEXT NOT NULL DEFAULT 'default';
+        ALTER TABLE target_state DROP CONSTRAINT IF EXISTS target_state_pkey;
+        ALTER TABLE target_state ADD PRIMARY KEY (profile, username);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='live_events' AND column_name='profile'
+    ) THEN
+        ALTER TABLE live_events ADD COLUMN profile TEXT NOT NULL DEFAULT 'default';
+    END IF;
+
+    -- Old poll_meta had a single id=1 row; migrate it to profile-keyed.
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='poll_meta' AND column_name='id'
+    ) THEN
+        ALTER TABLE poll_meta ADD COLUMN IF NOT EXISTS profile TEXT;
+        UPDATE poll_meta SET profile='default' WHERE profile IS NULL;
+        ALTER TABLE poll_meta DROP CONSTRAINT IF EXISTS poll_meta_pkey;
+        ALTER TABLE poll_meta DROP COLUMN IF EXISTS id;
+        ALTER TABLE poll_meta ALTER COLUMN profile SET NOT NULL;
+        ALTER TABLE poll_meta ADD PRIMARY KEY (profile);
+    END IF;
+END $$;
 """
 
 _pool: ConnectionPool | None = None
@@ -149,16 +184,11 @@ def _pool_required() -> ConnectionPool:
     return _pool
 
 
-def record_check(username: str, status: str) -> dict[str, Any] | None:
-    """Atomically update target_state. Returns a transition event dict
-    {"event": ..., "at": iso, "duration_seconds": int?} when the status
-    actually changed, otherwise None.
-
-    Mirrors the old state.record_check semantics:
-      * unknown after a known state -> no transition, last_check still bumps
-      * known status equal to prior -> no transition, last_check still bumps
-      * live <-> offline -> transition event written to live_events
-    """
+def record_check(
+    profile: str, username: str, status: str
+) -> dict[str, Any] | None:
+    """Atomically update target_state for (profile, username). Returns a
+    transition event dict when the status actually changed."""
     pool = _pool_required()
     now = datetime.now(timezone.utc)
     event: dict[str, Any] | None = None
@@ -167,8 +197,8 @@ def record_check(username: str, status: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT status, live_started_at FROM target_state "
-                "WHERE username = %s FOR UPDATE",
-                (username,),
+                "WHERE profile = %s AND username = %s FOR UPDATE",
+                (profile, username),
             )
             row = cur.fetchone()
 
@@ -176,22 +206,22 @@ def record_check(username: str, status: str) -> dict[str, Any] | None:
                 live_started = now if status == "live" else None
                 cur.execute(
                     "INSERT INTO target_state "
-                    "(username, status, last_check, last_change, live_started_at) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (username, status, now, now, live_started),
+                    "(profile, username, status, last_check, last_change, live_started_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (profile, username, status, now, now, live_started),
                 )
                 if status == "live":
                     cur.execute(
-                        "INSERT INTO live_events (username, event, at) "
-                        "VALUES (%s, 'live_start', %s)",
-                        (username, now),
+                        "INSERT INTO live_events (profile, username, event, at) "
+                        "VALUES (%s, %s, 'live_start', %s)",
+                        (profile, username, now),
                     )
                     event = {"event": "live_start", "at": now.isoformat(timespec="seconds")}
                 elif status == "offline":
                     cur.execute(
-                        "INSERT INTO live_events (username, event, at) "
-                        "VALUES (%s, 'first_seen_offline', %s)",
-                        (username, now),
+                        "INSERT INTO live_events (profile, username, event, at) "
+                        "VALUES (%s, %s, 'first_seen_offline', %s)",
+                        (profile, username, now),
                     )
             else:
                 prev = row["status"]
@@ -200,20 +230,20 @@ def record_check(username: str, status: str) -> dict[str, Any] | None:
                 if status == "unknown" or status == prev:
                     cur.execute(
                         "UPDATE target_state SET last_check = %s, updated_at = NOW() "
-                        "WHERE username = %s",
-                        (now, username),
+                        "WHERE profile = %s AND username = %s",
+                        (now, profile, username),
                     )
                 elif status == "live":
                     cur.execute(
                         "UPDATE target_state SET status=%s, last_check=%s, "
                         "last_change=%s, live_started_at=%s, updated_at=NOW() "
-                        "WHERE username=%s",
-                        (status, now, now, now, username),
+                        "WHERE profile=%s AND username=%s",
+                        (status, now, now, now, profile, username),
                     )
                     cur.execute(
-                        "INSERT INTO live_events (username, event, at) "
-                        "VALUES (%s, 'live_start', %s)",
-                        (username, now),
+                        "INSERT INTO live_events (profile, username, event, at) "
+                        "VALUES (%s, %s, 'live_start', %s)",
+                        (profile, username, now),
                     )
                     event = {"event": "live_start", "at": now.isoformat(timespec="seconds")}
                 elif status == "offline":
@@ -223,13 +253,14 @@ def record_check(username: str, status: str) -> dict[str, Any] | None:
                     cur.execute(
                         "UPDATE target_state SET status=%s, last_check=%s, "
                         "last_change=%s, live_started_at=NULL, updated_at=NOW() "
-                        "WHERE username=%s",
-                        (status, now, now, username),
+                        "WHERE profile=%s AND username=%s",
+                        (status, now, now, profile, username),
                     )
                     cur.execute(
-                        "INSERT INTO live_events (username, event, at, duration_seconds) "
-                        "VALUES (%s, 'live_end', %s, %s)",
-                        (username, now, duration),
+                        "INSERT INTO live_events "
+                        "(profile, username, event, at, duration_seconds) "
+                        "VALUES (%s, %s, 'live_end', %s, %s)",
+                        (profile, username, now, duration),
                     )
                     event = {
                         "event": "live_end",
@@ -239,24 +270,42 @@ def record_check(username: str, status: str) -> dict[str, Any] | None:
                         event["duration_seconds"] = duration
 
             cur.execute(
-                "UPDATE poll_meta SET last_poll_at = %s WHERE id = 1", (now,)
+                "INSERT INTO poll_meta (profile, last_poll_at) VALUES (%s, %s) "
+                "ON CONFLICT (profile) DO UPDATE SET last_poll_at = EXCLUDED.last_poll_at",
+                (profile, now),
             )
         conn.commit()
     return event
 
 
 def get_state() -> dict[str, Any]:
-    """Snapshot for the web dashboard: targets keyed by username + last poll."""
+    """Snapshot for the web dashboard. Shape:
+
+    {
+      "profiles": {
+        "<profile_name>": {
+          "targets": {"<username>": {status, last_check, ..., history: [...]}},
+          "last_poll_at": "iso",
+        },
+        ...
+      },
+      "last_poll_at": "iso" | None,   # max across profiles, for the global pill
+    }
+    """
     pool = _pool_required()
-    targets: dict[str, Any] = {}
+    profiles: dict[str, dict[str, Any]] = {}
+
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT username, status, last_check, last_change, live_started_at "
-                "FROM target_state ORDER BY username"
+                "SELECT profile, username, status, last_check, last_change, live_started_at "
+                "FROM target_state ORDER BY profile, username"
             )
             for r in cur.fetchall():
-                targets[r["username"]] = {
+                prof = profiles.setdefault(
+                    r["profile"], {"targets": {}, "last_poll_at": None}
+                )
+                prof["targets"][r["username"]] = {
                     "status": r["status"],
                     "last_check": _iso(r["last_check"]),
                     "last_change": _iso(r["last_change"]),
@@ -264,15 +313,19 @@ def get_state() -> dict[str, Any]:
                     "history": [],
                 }
 
-            if targets:
+            if profiles:
                 cur.execute(
-                    "SELECT username, event, at, duration_seconds FROM live_events "
-                    "WHERE username = ANY(%s) "
-                    "ORDER BY at DESC LIMIT 200",
-                    (list(targets.keys()),),
+                    "SELECT profile, username, event, at, duration_seconds "
+                    "FROM live_events ORDER BY at DESC LIMIT 500"
                 )
                 for r in cur.fetchall():
-                    targets[r["username"]]["history"].append(
+                    prof = profiles.get(r["profile"])
+                    if not prof:
+                        continue
+                    target = prof["targets"].get(r["username"])
+                    if not target:
+                        continue
+                    target["history"].append(
                         {
                             "event": r["event"],
                             "at": _iso(r["at"]),
@@ -280,11 +333,16 @@ def get_state() -> dict[str, Any]:
                         }
                     )
 
-            cur.execute("SELECT last_poll_at FROM poll_meta WHERE id = 1")
-            row = cur.fetchone()
-            last_poll = _iso(row["last_poll_at"]) if row else None
+            cur.execute("SELECT profile, last_poll_at FROM poll_meta")
+            for r in cur.fetchall():
+                if r["profile"] in profiles:
+                    profiles[r["profile"]]["last_poll_at"] = _iso(r["last_poll_at"])
 
-    return {"targets": targets, "last_poll_at": last_poll}
+    overall_last = max(
+        (p["last_poll_at"] for p in profiles.values() if p["last_poll_at"]),
+        default=None,
+    )
+    return {"profiles": profiles, "last_poll_at": overall_last}
 
 
 def _iso(dt: datetime | None) -> str | None:
