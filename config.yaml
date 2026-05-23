@@ -11,6 +11,7 @@ profiles:
       - paloyzzzz05
       - fon_.17
       - peemwrk
+      - sarintip_12
 
   # Add a second profile by uncommenting and editing. Run `--login` once
   # against the new profile to populate its user_data_dir.
@@ -18,6 +19,7 @@ profiles:
     user_data_dir: ./data/auth_minasan245
     targets:
       - manownongp
+      - atm.1150
 
   # Add a second profile by uncommenting and editing. Run `--login` once
   # against the new profile to populate its user_data_dir.
@@ -29,11 +31,10 @@ profiles:
 
 poll_interval_seconds: 60
 
-# Keep the TikTok browser visible while the scout runs.
-# Set to true to hide it. Headless mode may also trigger anti-bot UI from
-# TikTok (collapsed Following list, etc.), so headed is generally more
-# reliable for detection.
-headless: false
+# Run the TikTok browser headless (no visible window). With the API-based
+# detector this is fine — we never need to interact with the page visually,
+# just listen for the /webcast/feed response after each /live reload.
+headless: true
 
 # Where the scout writes a screenshot/HTML when something looks off.
 debug_dump_dir: ./data/debug

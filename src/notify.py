@@ -24,13 +24,29 @@ async def send(webhook_url: str | None, content: str, embed: dict[str, Any] | No
         log.warning("discord webhook failed: %s", exc)
 
 
-def live_start_embed(username: str, started_at: str) -> dict[str, Any]:
-    return {
-        "title": f"@{username} is LIVE",
+def live_start_embed(
+    username: str,
+    started_at: str,
+    *,
+    nickname: str | None = None,
+    title: str | None = None,
+    viewer_count: int | None = None,
+) -> dict[str, Any]:
+    embed: dict[str, Any] = {
+        "title": f"{nickname or username} is LIVE"
+        + (f" — {title}" if title else ""),
         "url": f"https://www.tiktok.com/@{username}/live",
         "color": 0xFE2C55,
-        "fields": [{"name": "Started", "value": started_at, "inline": True}],
+        "fields": [
+            {"name": "Username", "value": f"@{username}", "inline": True},
+            {"name": "Started", "value": started_at, "inline": True},
+        ],
     }
+    if viewer_count is not None:
+        embed["fields"].append(
+            {"name": "Viewers", "value": str(viewer_count), "inline": True}
+        )
+    return embed
 
 
 def live_end_embed(username: str, ended_at: str, duration_seconds: int | None) -> dict[str, Any]:

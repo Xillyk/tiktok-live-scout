@@ -19,7 +19,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from . import db, notify
+from . import db, detector_api, notify
 from .config import Config, load as load_config
 
 log = logging.getLogger("scout")
@@ -370,33 +370,64 @@ async def dump_debug(page: Page, debug_dir: Path, label: str) -> None:
         log.debug("debug dump failed: %s", exc)
 
 
-async def cycle(page: Page, cfg: Config, profile) -> None:
-    """One polling cycle for the given profile."""
-    statuses = await detect_via_live_page(page, profile.targets, cfg.debug_dump_dir)
+async def cycle(
+    page: Page,
+    cfg: Config,
+    profile,
+    feed_listener: detector_api.FollowingFeedListener,
+) -> None:
+    """One polling cycle for the given profile.
+
+    Primary detection is the webcast/feed API. We trigger a fresh fetch by
+    reloading /live (so TikTok's own signed call fires) and the response
+    listener captures the parsed JSON."""
+    entries = await feed_listener.fetch(page)
+    if entries is None:
+        log.warning("[%s] webcast/feed unreachable — skipping cycle", profile.name)
+        return
+
+    statuses = detector_api.status_map(entries, profile.targets)
 
     for username in profile.targets:
-        status = statuses.get(username, "unknown")
-        if status == "unknown":
-            log.warning(
-                "[%s] @%s status=unknown — see data/debug/",
-                profile.name,
-                username,
-            )
+        info = statuses[username]
+        status = info["status"]
 
-        event = db.record_check(profile.name, username, status)
+        event = db.record_check(profile.name, username, status, meta=info)
+
+        # Time-series sample for the detail-page graphs: one row per cycle
+        # while the target is live.
+        if status == "live":
+            try:
+                db.record_sample(profile.name, username, info)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("record_sample failed for @%s: %s", username, exc)
+        nick = info.get("nickname")
+        viewers = info.get("user_count")
+        suffix = ""
+        if event and event["event"] in ("live_start", "live_end"):
+            suffix = " (transition!)"
+        elif status == "live" and viewers is not None:
+            suffix = f" — {nick or ''} ({viewers} viewers)".rstrip()
         log.info(
             "[%s] @%s status=%s%s",
             profile.name,
             username,
             status,
-            " (transition!)" if event and event["event"] in ("live_start", "live_end") else "",
+            suffix,
         )
 
         if event and event["event"] == "live_start":
             await notify.send(
                 cfg.discord_webhook_url,
-                f"[{profile.name}] @{username} is now LIVE → https://www.tiktok.com/@{username}/live",
-                notify.live_start_embed(username, event["at"]),
+                f"[{profile.name}] @{username} is now LIVE → "
+                f"https://www.tiktok.com/@{username}/live",
+                notify.live_start_embed(
+                    username,
+                    event["at"],
+                    nickname=info.get("nickname"),
+                    title=info.get("title"),
+                    viewer_count=info.get("user_count"),
+                ),
             )
         elif event and event["event"] == "live_end":
             await notify.send(
@@ -530,10 +561,20 @@ async def main_async(args: argparse.Namespace) -> int:
                 log.debug("ctx.close raised: %s", exc)
             return 1
 
+        # Hook the response listener BEFORE the first /live navigation so
+        # we don't miss the initial Following-channel call.
+        feed_listener = detector_api.FollowingFeedListener()
+        feed_listener.attach(page)
+        try:
+            await page.goto(LIVE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not navigate to /live: %s", exc)
+
         try:
             while True:
                 try:
-                    await cycle(page, cfg, profile)
+                    await cycle(page, cfg, profile, feed_listener)
                 except Exception:  # noqa: BLE001
                     log.exception("cycle failed")
                     await dump_debug(page, cfg.debug_dump_dir, "cycle_error")

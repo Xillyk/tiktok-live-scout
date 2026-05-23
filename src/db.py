@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS target_state (
     last_check       TIMESTAMPTZ,
     last_change      TIMESTAMPTZ,
     live_started_at  TIMESTAMPTZ,
+    live_nickname    TEXT,
+    live_title       TEXT,
+    live_viewer_count INTEGER,
+    live_room_id     TEXT,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (profile, username)
 );
@@ -52,6 +56,25 @@ CREATE INDEX IF NOT EXISTS live_events_username_at_idx
     ON live_events (username, at DESC);
 CREATE INDEX IF NOT EXISTS live_events_profile_at_idx
     ON live_events (profile, at DESC);
+
+-- Per-cycle time-series sample of a live stream. One row inserted every
+-- cycle that a target is detected live. Used for the dashboard graphs.
+CREATE TABLE IF NOT EXISTS live_samples (
+    id              BIGSERIAL PRIMARY KEY,
+    profile         TEXT NOT NULL,
+    username        TEXT NOT NULL,
+    at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    title           TEXT,
+    user_count      INTEGER,
+    like_count      BIGINT,
+    hashtag_title   TEXT,
+    follower_count  BIGINT,
+    following_count BIGINT,
+    live_room_mode  INTEGER,
+    live_level      TEXT
+);
+CREATE INDEX IF NOT EXISTS live_samples_target_at_idx
+    ON live_samples (profile, username, at DESC);
 
 CREATE TABLE IF NOT EXISTS poll_meta (
     profile       TEXT PRIMARY KEY,
@@ -76,6 +99,12 @@ BEGIN
     ) THEN
         ALTER TABLE live_events ADD COLUMN profile TEXT NOT NULL DEFAULT 'default';
     END IF;
+
+    -- Live-metadata columns added when the API detector landed.
+    ALTER TABLE target_state ADD COLUMN IF NOT EXISTS live_nickname TEXT;
+    ALTER TABLE target_state ADD COLUMN IF NOT EXISTS live_title TEXT;
+    ALTER TABLE target_state ADD COLUMN IF NOT EXISTS live_viewer_count INTEGER;
+    ALTER TABLE target_state ADD COLUMN IF NOT EXISTS live_room_id TEXT;
 
     -- Old poll_meta had a single id=1 row; migrate it to profile-keyed.
     IF EXISTS (
@@ -185,13 +214,25 @@ def _pool_required() -> ConnectionPool:
 
 
 def record_check(
-    profile: str, username: str, status: str
+    profile: str,
+    username: str,
+    status: str,
+    meta: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Atomically update target_state for (profile, username). Returns a
-    transition event dict when the status actually changed."""
+    transition event dict when the status actually changed.
+
+    `meta` is optional and only used when status == 'live' — it can carry
+    nickname / title / viewer_count / room_id from the API detector. On
+    live_end transitions those columns are cleared."""
     pool = _pool_required()
     now = datetime.now(timezone.utc)
     event: dict[str, Any] | None = None
+
+    nickname = (meta or {}).get("nickname")
+    title = (meta or {}).get("title")
+    viewer_count = (meta or {}).get("user_count")
+    room_id = (meta or {}).get("room_id")
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -206,9 +247,15 @@ def record_check(
                 live_started = now if status == "live" else None
                 cur.execute(
                     "INSERT INTO target_state "
-                    "(profile, username, status, last_check, last_change, live_started_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (profile, username, status, now, now, live_started),
+                    "(profile, username, status, last_check, last_change, "
+                    " live_started_at, live_nickname, live_title, "
+                    " live_viewer_count, live_room_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (profile, username, status, now, now, live_started,
+                     nickname if status == "live" else None,
+                     title if status == "live" else None,
+                     viewer_count if status == "live" else None,
+                     room_id if status == "live" else None),
                 )
                 if status == "live":
                     cur.execute(
@@ -227,7 +274,24 @@ def record_check(
                 prev = row["status"]
                 started = row["live_started_at"]
 
-                if status == "unknown" or status == prev:
+                if status == "unknown":
+                    cur.execute(
+                        "UPDATE target_state SET last_check = %s, updated_at = NOW() "
+                        "WHERE profile = %s AND username = %s",
+                        (now, profile, username),
+                    )
+                elif status == "live" and prev == "live":
+                    # Still live — refresh metadata (viewer_count moves).
+                    cur.execute(
+                        "UPDATE target_state SET last_check=%s, "
+                        "live_nickname=%s, live_title=%s, "
+                        "live_viewer_count=%s, live_room_id=%s, "
+                        "updated_at=NOW() "
+                        "WHERE profile=%s AND username=%s",
+                        (now, nickname, title, viewer_count, room_id,
+                         profile, username),
+                    )
+                elif status == prev:
                     cur.execute(
                         "UPDATE target_state SET last_check = %s, updated_at = NOW() "
                         "WHERE profile = %s AND username = %s",
@@ -236,9 +300,14 @@ def record_check(
                 elif status == "live":
                     cur.execute(
                         "UPDATE target_state SET status=%s, last_check=%s, "
-                        "last_change=%s, live_started_at=%s, updated_at=NOW() "
+                        "last_change=%s, live_started_at=%s, "
+                        "live_nickname=%s, live_title=%s, "
+                        "live_viewer_count=%s, live_room_id=%s, "
+                        "updated_at=NOW() "
                         "WHERE profile=%s AND username=%s",
-                        (status, now, now, now, profile, username),
+                        (status, now, now, now,
+                         nickname, title, viewer_count, room_id,
+                         profile, username),
                     )
                     cur.execute(
                         "INSERT INTO live_events (profile, username, event, at) "
@@ -252,7 +321,10 @@ def record_check(
                     )
                     cur.execute(
                         "UPDATE target_state SET status=%s, last_check=%s, "
-                        "last_change=%s, live_started_at=NULL, updated_at=NOW() "
+                        "last_change=%s, live_started_at=NULL, "
+                        "live_nickname=NULL, live_title=NULL, "
+                        "live_viewer_count=NULL, live_room_id=NULL, "
+                        "updated_at=NOW() "
                         "WHERE profile=%s AND username=%s",
                         (status, now, now, profile, username),
                     )
@@ -298,7 +370,9 @@ def get_state() -> dict[str, Any]:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT profile, username, status, last_check, last_change, live_started_at "
+                "SELECT profile, username, status, last_check, last_change, "
+                "live_started_at, live_nickname, live_title, live_viewer_count, "
+                "live_room_id "
                 "FROM target_state ORDER BY profile, username"
             )
             for r in cur.fetchall():
@@ -310,6 +384,10 @@ def get_state() -> dict[str, Any]:
                     "last_check": _iso(r["last_check"]),
                     "last_change": _iso(r["last_change"]),
                     "live_started_at": _iso(r["live_started_at"]),
+                    "live_nickname": r["live_nickname"],
+                    "live_title": r["live_title"],
+                    "live_viewer_count": r["live_viewer_count"],
+                    "live_room_id": r["live_room_id"],
                     "history": [],
                 }
 
@@ -343,6 +421,129 @@ def get_state() -> dict[str, Any]:
         default=None,
     )
     return {"profiles": profiles, "last_poll_at": overall_last}
+
+
+def record_sample(profile: str, username: str, meta: dict[str, Any]) -> None:
+    """Insert one time-series sample of the target's live state.
+
+    Called from the scout each polling cycle that the target is detected
+    live. `meta` is the dict returned by detector_api.status_map with all
+    8 graphable fields populated."""
+    pool = _pool_required()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO live_samples "
+                "(profile, username, title, user_count, like_count, "
+                " hashtag_title, follower_count, following_count, "
+                " live_room_mode, live_level) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    profile,
+                    username,
+                    meta.get("title"),
+                    meta.get("user_count"),
+                    meta.get("like_count"),
+                    meta.get("hashtag_title"),
+                    meta.get("follower_count"),
+                    meta.get("following_count"),
+                    meta.get("live_room_mode"),
+                    meta.get("live_level"),
+                ),
+            )
+        conn.commit()
+
+
+def get_sessions(
+    profile: str, username: str, since_seconds: int = 60 * 86400
+) -> list[dict[str, Any]]:
+    """Return live sessions for (profile, username), oldest first.
+
+    Completed sessions are pulled from the `live_events` log (each
+    `live_end` row carries its duration so we can derive the start).
+    An ongoing session (if the target is currently live) is appended
+    from `target_state`."""
+    pool = _pool_required()
+    sessions: list[dict[str, Any]] = []
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT (at - make_interval(secs => duration_seconds)) "
+                "         AS started_at, "
+                "       at AS ended_at, "
+                "       duration_seconds "
+                "FROM live_events "
+                "WHERE profile=%s AND username=%s "
+                "  AND event='live_end' "
+                "  AND duration_seconds IS NOT NULL "
+                "  AND at >= NOW() - make_interval(secs => %s) "
+                "ORDER BY at ASC",
+                (profile, username, since_seconds),
+            )
+            for r in cur.fetchall():
+                sessions.append(
+                    {
+                        "start": _iso(r["started_at"]),
+                        "end": _iso(r["ended_at"]),
+                        "duration_seconds": r["duration_seconds"],
+                        "ongoing": False,
+                    }
+                )
+
+            cur.execute(
+                "SELECT live_started_at, live_title, live_viewer_count "
+                "FROM target_state "
+                "WHERE profile=%s AND username=%s AND status='live' "
+                "  AND live_started_at IS NOT NULL",
+                (profile, username),
+            )
+            row = cur.fetchone()
+            if row:
+                sessions.append(
+                    {
+                        "start": _iso(row["live_started_at"]),
+                        "end": None,
+                        "duration_seconds": None,
+                        "title": row["live_title"],
+                        "viewer_count": row["live_viewer_count"],
+                        "ongoing": True,
+                    }
+                )
+
+    return sessions
+
+
+def get_samples(
+    profile: str, username: str, since_seconds: int
+) -> list[dict[str, Any]]:
+    """Return samples for (profile, username) within the last
+    `since_seconds`, oldest first."""
+    pool = _pool_required()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT at, title, user_count, like_count, hashtag_title, "
+                "follower_count, following_count, live_room_mode, live_level "
+                "FROM live_samples "
+                "WHERE profile=%s AND username=%s "
+                "  AND at >= NOW() - make_interval(secs => %s) "
+                "ORDER BY at ASC",
+                (profile, username, since_seconds),
+            )
+            return [
+                {
+                    "at": _iso(r["at"]),
+                    "title": r["title"],
+                    "user_count": r["user_count"],
+                    "like_count": r["like_count"],
+                    "hashtag_title": r["hashtag_title"],
+                    "follower_count": r["follower_count"],
+                    "following_count": r["following_count"],
+                    "live_room_mode": r["live_room_mode"],
+                    "live_level": r["live_level"],
+                }
+                for r in cur.fetchall()
+            ]
 
 
 def _iso(dt: datetime | None) -> str | None:
