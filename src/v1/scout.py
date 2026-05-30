@@ -115,7 +115,7 @@ async def detect_via_live_page(
 
     if await is_logged_out(page):
         log.error(
-            "session expired on /live — re-run `python -m src.scout --login`"
+            "session expired on /live — re-run `python -m src.v1.scout --login`"
         )
         await dump_debug(page, debug_dir, "logged_out_live")
         return result
@@ -549,7 +549,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
         if not await is_logged_in(page):
             log.error(
-                "not logged in. run `python -m src.scout --login` first."
+                "not logged in. run `python -m src.v1.scout --login` first."
             )
             try:
                 db.close()

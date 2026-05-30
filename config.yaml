@@ -12,6 +12,7 @@ profiles:
       - fon_.17
       - peemwrk
       - sarintip_12
+      - _lulababe
 
   # Add a second profile by uncommenting and editing. Run `--login` once
   # against the new profile to populate its user_data_dir.

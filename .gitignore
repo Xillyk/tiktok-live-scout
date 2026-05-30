@@ -9,3 +9,7 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# Local TikTok response dumps from manual probing.
+*_response.json
+webkit_res.json

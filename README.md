@@ -76,9 +76,9 @@ the login window automatically.
 ```sh
 source .venv/bin/activate
 docker compose up -d
-python -m src.scout --login --profile bobabenz1   # one-time per profile
-python -m src.scout --profile bobabenz1           # terminal 1 — watcher
-python -m src.web                                 # terminal 2 — dashboard
+python -m src.v1.scout --login --profile bobabenz1   # one-time per profile
+python -m src.v1.scout --profile bobabenz1           # terminal 1 — watcher
+python -m src.v1.web                                 # terminal 2 — dashboard
 ```
 
 The Postgres container publishes on a random free host port — the scout and
@@ -117,17 +117,17 @@ docker compose exec postgres psql -U scout -d tiktok_live_scout \
 
 - **"could not connect to Postgres"** — `docker compose up -d` and wait for the
   healthcheck (`docker compose ps` should show `healthy`).
-- **"not logged in"** — TikTok cookie expired. Re-run `python -m src.scout --login`.
+- **"not logged in"** — TikTok cookie expired. Re-run `python -m src.v1.scout --login`.
 - **Status stays `unknown`** — either the "View all" button couldn't be found
   or the target isn't in the expanded list even after scrolling. Check
   `data/debug/following_miss_<username>.png` to see what the page looked like.
-  Selectors may need tweaking in `src/scout.py::open_view_all`.
+  Selectors may need tweaking in `src/v1/scout.py::open_view_all`.
 - **No Discord ping** — confirm `DISCORD_WEBHOOK_URL` is set; check
   `logs/scout.log` for `discord webhook returned …` lines.
 
 ## Run on a schedule (optional, macOS)
 
 The scout is a long-running process — easiest path is to leave it in a
-terminal, or wrap it in a `launchd` plist that runs `python -m src.scout`
+terminal, or wrap it in a `launchd` plist that runs `python -m src.v1.scout`
 on login with `KeepAlive: true`. Ping me when you want that and I'll generate
 the plist.

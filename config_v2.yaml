@@ -1,0 +1,13 @@
+# v2 scout targets — login-less, just a flat list of TikTok usernames.
+# Add or remove targets as you like; the launcher spawns one scout process
+# per target on every run.
+targets:
+  - fahsaiiisan
+  - _praewran_
+  - fon_.17
+  - peemwrk
+  - sarintip_12
+  - _lulababe
+  - manownongp
+  - atm.1150
+  - tmkay.02
