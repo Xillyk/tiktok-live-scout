@@ -41,13 +41,11 @@ import asyncio
 import json
 import logging
 import random
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import httpx
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import (
     CommentEvent,
@@ -90,68 +88,68 @@ INITIAL_BACKOFF_S = 5.0
 BACKOFF_MULTIPLIER = 1.6
 MAX_BACKOFF_S = 300.0
 
-SIGI_RE = re.compile(
-    r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', re.DOTALL,
-)
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-
-
 # ---------------------------------------------------------------- discovery
 
+# Reuse one TikTokLive client per username so the underlying curl_cffi
+# session, device id, and signed-cookie cache survive across polls.
+_DISCOVERY_CLIENTS: dict[str, TikTokLiveClient] = {}
+
+
+def _discovery_client(username: str) -> TikTokLiveClient:
+    c = _DISCOVERY_CLIENTS.get(username)
+    if c is None:
+        c = TikTokLiveClient(unique_id=f"@{username}")
+        _DISCOVERY_CLIENTS[username] = c
+    return c
+
+
 async def discover(username: str) -> dict | None:
-    """One HTTP GET to /@user/live. Parse SIGI_STATE. Return a descriptor
-    with room_id/title/cover_url/started_at/follower_count if the target's
-    user.status == 2, else None."""
-    url = f"https://www.tiktok.com/@{username}/live"
+    """Resolve current live status via TikTokLive's signed API path.
+
+    Previously we GET'd /@user/live and parsed SIGI_STATE, but TikTok now
+    serves a ~1KB shell page (only a `slardar-config` script) to every
+    non-browser fingerprint — including curl_cffi's Chrome impersonation —
+    so SIGI_STATE is never present. fetch_room_id_from_api hits the same
+    internal endpoint TikTokLive uses to bootstrap a WS connect and is
+    not subject to that block. Returns the same descriptor shape as
+    before (room_id / title / cover_url / started_at / follower_count /
+    nickname), or None when the target isn't live or the API call fails."""
+    client = _discovery_client(username)
     try:
-        async with httpx.AsyncClient(
-            timeout=15.0,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            follow_redirects=True,
-        ) as c:
-            r = await c.get(url)
+        room_id = await client.web.fetch_room_id_from_api(unique_id=username)
     except Exception as exc:  # noqa: BLE001
-        log.warning("discover: HTTP error for @%s: %r", username, exc)
+        log.info("discover: room_id_from_api failed for @%s: %r", username, exc)
         return None
-    if r.status_code != 200:
-        log.info("discover: @%s returned http=%d", username, r.status_code)
-        return None
-    m = SIGI_RE.search(r.text)
-    if not m:
-        log.info("discover: SIGI_STATE not present in @%s HTML", username)
+    if not room_id:
         return None
     try:
-        sigi = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        log.warning("discover: SIGI_STATE not parseable for @%s", username)
+        info = await client.web.fetch_room_info(room_id=room_id)
+    except Exception as exc:  # noqa: BLE001
+        log.info("discover: room_info failed for @%s (room=%s): %r",
+                 username, room_id, exc)
         return None
-    info = (sigi.get("LiveRoom") or {}).get("liveRoomUserInfo") or {}
-    user = info.get("user") or {}
-    if user.get("status") != 2:
+    info = info or {}
+    if info.get("status") != 2:
         return None
-    live = info.get("liveRoom") or {}
-    stats = info.get("stats") or {}
+
+    owner = info.get("owner") or {}
+    follow = owner.get("follow_info") or {}
+    cover = info.get("cover") or {}
+    cover_urls = cover.get("url_list") or []
     started_at = None
-    if live.get("startTime"):
+    ct = info.get("create_time")
+    if ct:
         try:
-            started_at = datetime.fromtimestamp(live["startTime"], tz=timezone.utc)
+            started_at = datetime.fromtimestamp(int(ct), tz=timezone.utc)
         except (ValueError, TypeError, OSError):
             pass
     return {
-        "room_id": user.get("roomId") or live.get("roomId") or str(live.get("id") or ""),
-        "title": live.get("title"),
-        "cover_url": live.get("coverUrl"),
+        "room_id": str(info.get("id_str") or room_id),
+        "title": info.get("title"),
+        "cover_url": cover_urls[0] if cover_urls else None,
         "started_at": started_at or datetime.now(timezone.utc),
-        "follower_count": stats.get("followerCount"),
-        "nickname": user.get("nickname"),
+        "follower_count": follow.get("follower_count"),
+        "nickname": owner.get("nickname"),
     }
 
 
