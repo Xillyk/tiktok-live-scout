@@ -496,6 +496,18 @@ async def run_session(
 async def scout_target(username: str, jsonl_path: Path | None) -> None:
     db.upsert_target(username)
 
+    # Sweep stale open sessions inherited from a prior scout that died
+    # without firing LiveEndEvent / DisconnectEvent (SIGKILL, OOM, host
+    # crash, network drop). Those rows sit with ended_at=NULL forever
+    # and the dashboard wrongly reports LIVE. If the host is in fact
+    # still live with the same room_id, the UPSERT in open_session will
+    # immediately reset ended_at=NULL again — so a brief offline blip
+    # at startup is the cost of correctness.
+    orphans = db.close_orphan_open_sessions(username)
+    if orphans:
+        log.info("closed %d orphaned open session(s) for @%s: %s",
+                 len(orphans), username, orphans)
+
     jsonl_f = None
     jsonl_sink: Callable[[dict], None] | None = None
     if jsonl_path:

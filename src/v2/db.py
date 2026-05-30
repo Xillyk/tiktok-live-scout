@@ -234,6 +234,27 @@ def close_session(
         conn.commit()
 
 
+def close_orphan_open_sessions(username: str) -> list[int]:
+    """Close every open session for `username` (those still NULL ended_at).
+    Called on scout startup — if a previous scout died with SIGKILL or
+    the host crashed, the live_end / disconnect handler never ran and
+    the row sits open forever, which makes the dashboard show LIVE for
+    a stream that ended hours ago. Returns ids that were closed."""
+    pool = _pool_required()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE v2_sessions "
+                "SET ended_at = NOW(), end_reason = 'orphaned' "
+                "WHERE username = %s AND ended_at IS NULL "
+                "RETURNING id",
+                (username,),
+            )
+            ids = [r["id"] for r in cur.fetchall()]
+        conn.commit()
+    return ids
+
+
 # Column order mirrors the v2_events DDL so the executemany payload stays tight.
 _EVENT_COLS = (
     "session_id", "at", "kind",
